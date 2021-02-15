@@ -1,9 +1,40 @@
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "filegroup")
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "genrule")
 load("//tensorflow/compiler/aot:tfcompile.bzl", "tf_library")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
+load("//tensorflow/compiler/mlir:glob_lit_test.bzl", "glob_lit_tests")
 
 package(
     default_visibility = ["//visibility:private"],
     licenses = ["notice"],  # Apache 2.0
+)
+
+glob_lit_tests(
+    data = [":filecheck_test_utilities"],
+    driver = "@llvm-project//mlir:run_lit.sh",
+    tags_override = {
+        "test_error_message.lit.pbtxt": ["no_oss"],  # TODO(b/150957738): to be fixed on oss.
+    },
+    test_file_exts = ["lit.pbtxt"],
+)
+
+# Bundle together all of the test utilities that are used by tests.
+filegroup(
+    name = "filecheck_test_utilities",
+    testonly = True,
+    srcs = [
+        "test_error_message.lit.pbtxt.config.pbtxt",
+        "test_error_message.lit.pbtxt.debug.pbtxt",
+        "test_error_message.lit.pbtxt.fake_py.debug",
+    ],
+    data = [
+        "//tensorflow/compiler/aot:tfcompile",
+        "@llvm-project//llvm:FileCheck",
+        "@llvm-project//llvm:not",
+    ],
 )
 
 # We disable some tfcompile tests in the open source build with the
@@ -30,6 +61,7 @@ test_suite(
         ":test_graph_tfvariable_test",
         ":tfcompile_test",
     ],
+    visibility = ["//visibility:public"],
 )
 
 py_binary(
@@ -37,7 +69,7 @@ py_binary(
     testonly = 1,
     srcs = ["make_test_graphs.py"],
     python_version = "PY3",
-    srcs_version = "PY2AND3",
+    srcs_version = "PY3",
     deps = [
         "//tensorflow/core:protos_all_py",
         "//tensorflow/python",  # TODO(b/34059704): remove when fixed
@@ -60,6 +92,7 @@ genrule(
     testonly = 1,
     outs = [
         "test_graph_tfadd.pb",
+        "test_debuginfo_tfadd.pb",
         "test_graph_tfadd_with_ckpt.ckpt",
         "test_graph_tfadd_with_ckpt.pb",
         "test_graph_tfadd_with_ckpt_saver.ckpt",
@@ -304,9 +337,9 @@ tf_cc_test(
         "//tensorflow/compiler/xla:xla_data_proto_cc",
         "//tensorflow/compiler/xla/service:hlo_profile_printer",
         "//tensorflow/core:lib",
-        "//tensorflow/core:regexp_internal",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "//tensorflow/core/platform:regexp",
         "//third_party/eigen3",
         "@com_google_absl//absl/strings",
     ],
@@ -317,6 +350,7 @@ tf_library(
     testonly = 1,
     config = "test_graph_tfadd.config.pbtxt",
     cpp_class = "AddComp",
+    debug_info = "test_debuginfo_tfadd.pb",
     graph = "test_graph_tfadd.pb",
     include_standard_runtime_deps = False,
     mlir_components = "Bridge",
@@ -526,9 +560,9 @@ tf_cc_test(
         "//tensorflow/compiler/xla:xla_data_proto_cc",
         "//tensorflow/compiler/xla/service:hlo_profile_printer",
         "//tensorflow/core:lib",
-        "//tensorflow/core:regexp_internal",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "//tensorflow/core/platform:regexp",
         "//third_party/eigen3",
         "@com_google_absl//absl/strings",
     ],

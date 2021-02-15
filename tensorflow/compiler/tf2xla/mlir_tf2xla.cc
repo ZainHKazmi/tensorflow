@@ -20,6 +20,12 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "mlir/Dialect/Shape/IR/Shape.h"  // from @llvm-project
+#include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
+#include "mlir/IR/Dialect.h"  // from @llvm-project
+#include "tensorflow/compiler/mlir/hlo/include/mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
+#include "tensorflow/compiler/mlir/tensorflow/ir/tf_executor.h"
+#include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/bridge.h"
 #include "tensorflow/compiler/mlir/tensorflow/transforms/passes.h"
 #include "tensorflow/compiler/mlir/tensorflow/translate/import_model.h"
@@ -54,13 +60,17 @@ Status ConvertInputInfo(
     GraphImportConfig* specs) {
   std::vector<std::string> array_names;
   std::vector<std::string> data_types;
-  std::vector<std::vector<int>> shapes;
+  std::vector<llvm::Optional<std::vector<int>>> shapes;
   for (const tf2xla::Feed& feed : config.feed()) {
     std::string place_holder_name =
         feed_name_remap.at(TensorIdToString(feed.id()));
     array_names.push_back(place_holder_name);
     data_types.push_back(
         feed.type() == DT_INVALID ? "" : DataType_Name(feed.type()));
+    if (feed.shape().unknown_rank()) {
+      shapes.push_back(llvm::None);
+      continue;
+    }
     std::vector<int> dims;
     dims.reserve(feed.shape().dim_size());
     absl::c_for_each(feed.shape().dim(), [&](const TensorShapeProto::Dim d) {
@@ -86,9 +96,10 @@ Status ConvertOutputInfo(const tf2xla::Config& config,
 
 }  // namespace
 
-Status ConvertGraphDefToXlaViaMlir(GraphDef graph_def,
-                                   const tf2xla::Config& config,
-                                   xla::XlaComputation* computation) {
+Status ConvertGraphDefToXlaViaMlir(
+    GraphDef graph_def, const tf2xla::Config& config,
+    xla::XlaComputation* computation, absl::string_view debug_info_filename,
+    absl::string_view debug_info_path_begin_marker) {
   // AddPlaceholdersForFeeds prepares for PruneGraphDefInto and serves two
   // purposes: (1) It creates a placeholder node for each feed, so that
   // PruneGraphDefInfo can prune away the node containing the feed. (2) It
@@ -115,6 +126,22 @@ Status ConvertGraphDefToXlaViaMlir(GraphDef graph_def,
   TF_RETURN_IF_ERROR(ConvertOutputInfo(config, &specs));
 
   GraphDebugInfo debug_info;
+  if (!debug_info_filename.empty()) {
+    TF_RETURN_IF_ERROR(LoadProtoFromFile(debug_info_filename, &debug_info));
+
+    if (!debug_info_path_begin_marker.empty()) {
+      for (size_t i = 0, e = debug_info.files_size(); i < e; ++i) {
+        std::string* file_name = debug_info.mutable_files(i);
+        size_t location =
+            file_name->rfind(std::string(debug_info_path_begin_marker));
+        if (location != std::string::npos) {
+          *file_name = file_name->substr(location +
+                                         debug_info_path_begin_marker.length());
+        }
+      }
+    }
+  }
+
   mlir::MLIRContext context;
   TF_ASSIGN_OR_RETURN(
       mlir::OwningModuleRef module,
@@ -129,20 +156,16 @@ Status ConvertGraphDefToXlaViaMlir(GraphDef graph_def,
   device_set.AddDevice(&device);
   AddDevicesToOp(*module, &device_set);
 
-  if (failed(mlir::TF::MarkFunctionVisibilityUsingEntryFunctionSpecification(
-          *module))) {
-    return errors::Internal("Problem with mark function visibility");
-  }
-
   TF_RETURN_IF_ERROR(mlir::TF::RunBridgeWithStandardPipeline(
       *module, /*enable_logging=*/VLOG_IS_ON(1), /*enable_inliner=*/true));
 
   // Convert the MLIR module to XLA computation. If the input graph can't be
   // lowered down to a single graph node with a single island by the previous
   // step, this step will return an error.
-  return ConvertMLIRToXlaComputation(*module, computation,
+  return ConvertMLIRToXlaComputation(*module, /*device_type=*/"XLA_CPU_JIT",
+                                     computation,
                                      /*use_tuple_args=*/false,
-                                     /*always_return_tuple=*/true);
+                                     /*return_tuple=*/true);
 }
 
 }  // namespace tensorflow

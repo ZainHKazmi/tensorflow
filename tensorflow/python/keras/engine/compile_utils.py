@@ -24,24 +24,99 @@ import six
 from tensorflow.python.distribute import distribution_strategy_context as ds_context
 from tensorflow.python.keras import losses as losses_mod
 from tensorflow.python.keras import metrics as metrics_mod
+from tensorflow.python.keras.utils import generic_utils
 from tensorflow.python.keras.utils import losses_utils
+from tensorflow.python.keras.utils import tf_utils
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops.losses import util as tf_losses_utils
 from tensorflow.python.util import nest
 
 
-class LossesContainer(object):
+class Container(object):
+  """Base Container class."""
+
+  def __init__(self, output_names=None):
+    self._output_names = output_names
+
+  def build(self, y_pred):
+    if self._output_names is None:
+      # In Subclass API, output names like 'output_1' are used for
+      # `Metric` names.
+      self._output_names = create_pseudo_output_names(y_pred)
+
+  def _conform_to_outputs(self, outputs, struct):
+    """Convenience method to conform `struct` to `outputs` structure.
+
+    Mappings performed:
+
+    (1) Map a dict to a list of outputs, using the output names.
+    (2) Fill missing keys in a dict w/ `None`s.
+    (3) Map a single item to all outputs.
+
+    Args:
+      outputs: Model predictions.
+      struct: Arbitrary nested structure (e.g. of labels, sample_weights,
+        losses, or metrics).
+
+    Returns:
+      Mapping of `struct` to `outputs` structure.
+    """
+    struct = map_to_output_names(outputs, self._output_names, struct)
+    struct = map_missing_dict_keys(outputs, struct)
+    # Allow passing one object that applies to all outputs.
+    if not nest.is_nested(struct) and nest.is_nested(outputs):
+      struct = nest.map_structure(lambda _: struct, outputs)
+    return struct
+
+  def _maybe_broadcast_to_outputs(self, outputs, objects):
+    """Determines if losses / metrics should be applied to all outputs.
+
+    NOTE: This method should only be called for Metrics / Losses, not for
+    y_true / sample_weight.
+
+    Args:
+      outputs: Model predictions.
+      objects: Arbitrary nested structure (e.g. of losses or metrics)
+
+    Returns:
+      Arbitrary nested structure of objects, maybe copied to each output.
+
+    Applies a Loss / Metric to all outputs.
+    """
+    if not self._should_broadcast(objects):
+      return objects
+
+    # When there is more than one Model output, this is needed to keep
+    # each Metric / Loss separate. When there is only one Model output,
+    # the user-supplied object should be used.
+    should_copy_objects = len(nest.flatten(outputs)) > 1
+
+    def _broadcast_fn():
+      if should_copy_objects:
+        return nest.map_structure(self._copy_object, objects)
+      return objects
+
+    return nest.map_structure(lambda _: _broadcast_fn(), outputs)
+
+  def _should_broadcast(self, objects):
+    raise NotImplementedError
+
+  def _copy_object(self, obj):
+    raise NotImplementedError
+
+
+class LossesContainer(Container):
   """A container class for losses passed to `Model.compile`."""
 
   def __init__(self, losses, loss_weights=None, output_names=None):
+    super(LossesContainer, self).__init__(output_names=output_names)
+
     # Keep user-supplied values untouched for recompiling and serialization.
     self._user_losses = losses
     self._user_loss_weights = loss_weights
 
     self._losses = losses
     self._loss_weights = loss_weights
-    self._output_names = output_names
     self._per_output_metrics = None  # Per-output losses become metrics.
     self._loss_metric = metrics_mod.Mean(name='loss')  # Total loss.
     self._built = False
@@ -57,34 +132,25 @@ class LossesContainer(object):
     ]
     return [self._loss_metric] + per_output_metrics
 
-  def _build(self, y_pred):
+  def build(self, y_pred):
     """One-time setup of loss objects."""
+    super(LossesContainer, self).build(y_pred)
 
-    if self._output_names is None:
-      # In Subclass API,  output names like 'output_1' are used for
-      # `Metric` names.
-      self._output_names = create_pseudo_output_names(y_pred)
-
-    # Accept a dict of losses keyed by output_name when outputs are a flat
-    # list.
-    self._losses = map_to_output_names(y_pred, self._output_names, self._losses)
-    self._loss_weights = map_to_output_names(y_pred, self._output_names,
-                                             self._loss_weights)
-
-    # Broadcast single config values to apply to each output.
-    if not nest.is_sequence(self._losses):
-      self._losses = nest.map_structure(lambda output: self._losses, y_pred)
-    if not nest.is_sequence(self._loss_weights):
-      self._loss_weights = nest.map_structure(lambda output: self._loss_weights,
-                                              y_pred)
-
+    self._losses = self._maybe_broadcast_to_outputs(y_pred, self._losses)
+    self._losses = self._conform_to_outputs(y_pred, self._losses)
     self._losses = nest.map_structure(self._get_loss_object, self._losses)
-
-    # Now that structures have been checked, it is safe to flatten.
     self._losses = nest.flatten(self._losses)
+
+    self._loss_weights = self._maybe_broadcast_to_outputs(
+        y_pred, self._loss_weights)
+    self._loss_weights = self._conform_to_outputs(y_pred, self._loss_weights)
     self._loss_weights = nest.flatten(self._loss_weights)
 
-    # Create per-output loss metrics, but only for multi-output Models.
+    self._create_metrics()
+    self._built = True
+
+  def _create_metrics(self):
+    """Creates per-output loss metrics, but only for multi-output Models."""
     if len(self._output_names) == 1:
       self._per_output_metrics = [None]
     else:
@@ -96,8 +162,6 @@ class LossesContainer(object):
           self._per_output_metrics.append(
               metrics_mod.Mean(output_name + '_loss'))
 
-    self._built = True
-
   def __call__(self,
                y_true,
                y_pred,
@@ -105,7 +169,7 @@ class LossesContainer(object):
                regularization_losses=None):
     """Computes the overall loss.
 
-    Arguments:
+    Args:
       y_true: An arbitrary structure of Tensors representing the ground truth.
       y_pred: An arbitrary structure of Tensors representing a Model's outputs.
       sample_weight: An arbitrary structure of Tensors representing the
@@ -117,48 +181,42 @@ class LossesContainer(object):
     Returns:
       Tuple of `(total_loss, per_output_loss_list)`
     """
-    y_true = map_to_output_names(y_pred, self._output_names, y_true)
-    sample_weight = map_to_output_names(y_pred, self._output_names,
-                                        sample_weight)
+    y_true = self._conform_to_outputs(y_pred, y_true)
+    sample_weight = self._conform_to_outputs(y_pred, sample_weight)
 
     if not self._built:
-      self._build(y_pred)
+      self.build(y_pred)
 
-    y_true = nest.flatten(y_true) if y_true is not None else []
     y_pred = nest.flatten(y_pred)
-
-    # TODO(omalleyt): Remove ambiguity here.
-    # This is currently needed to support passing only 1 loss and 1 target
-    # to a Functional Model with multiple outputs. However, this is
-    # ambiguous, especially with subclass, and we should reconsider how we
-    # support this.
-    if len(y_true) == 1 and len(y_pred) > 1:
-      y_true = y_true * len(y_pred)
-
+    y_true = nest.flatten(y_true)
     sample_weight = nest.flatten(sample_weight)
-    # Allows passing one sample-weight array for all outputs.
-    if len(sample_weight) == 1 and len(y_pred) > 1:
-      sample_weight = sample_weight * len(y_pred)
 
     loss_values = []  # Used for gradient calculation.
     loss_metric_values = []  # Used for loss metric calculation.
+    batch_dim = None
     zip_args = (y_true, y_pred, sample_weight, self._losses, self._loss_weights,
                 self._per_output_metrics)
     for y_t, y_p, sw, loss_obj, loss_weight, metric_obj in zip(*zip_args):
-      if loss_obj is None:  # Ok to have no loss for an output.
+      if y_t is None or loss_obj is None:  # Ok to have no loss for an output.
         continue
 
       y_t, y_p, sw = match_dtype_and_rank(y_t, y_p, sw)
-      sw = apply_mask(y_p, sw)
-
+      sw = apply_mask(y_p, sw, get_mask(y_p))
       loss_value = loss_obj(y_t, y_p, sample_weight=sw)
 
       loss_metric_value = loss_value
       # Correct for the `Mean` loss metrics counting each replica as a batch.
       if loss_obj.reduction == losses_utils.ReductionV2.SUM:
         loss_metric_value *= ds_context.get_strategy().num_replicas_in_sync
+
+      if batch_dim is None:
+        if tf_utils.is_ragged(y_t):
+          batch_dim = y_t.nrows()
+        else:
+          batch_dim = array_ops.shape(y_t)[0]
+
       if metric_obj is not None:
-        metric_obj.update_state(loss_metric_value)
+        metric_obj.update_state(loss_metric_value, sample_weight=batch_dim)
 
       if loss_weight is not None:
         loss_value *= loss_weight
@@ -182,7 +240,8 @@ class LossesContainer(object):
       loss_metric_values = losses_utils.cast_losses_to_common_dtype(
           loss_metric_values)
       total_loss_metric_value = math_ops.add_n(loss_metric_values)
-      self._loss_metric.update_state(total_loss_metric_value)
+      self._loss_metric.update_state(
+          total_loss_metric_value, sample_weight=batch_dim)
 
       loss_values = losses_utils.cast_losses_to_common_dtype(loss_values)
       total_loss = math_ops.add_n(loss_values)
@@ -197,7 +256,7 @@ class LossesContainer(object):
     Converts the user-supplied loss to a `Loss` object. Also allows
     `SUM_OVER_BATCH_SIZE` reduction to be used for this loss.
 
-    Arguments:
+    Args:
       loss: A string, function, or `Loss` object.
 
     Returns:
@@ -208,58 +267,72 @@ class LossesContainer(object):
 
     loss = losses_mod.get(loss)
     if not isinstance(loss, losses_mod.Loss):
-      loss_name = loss.__name__
+      loss_name = get_custom_object_name(loss)
+      if loss_name is None:
+        raise ValueError('Loss should be a callable, found: {}'.format(loss))
       loss = losses_mod.LossFunctionWrapper(loss, name=loss_name)
     loss._allow_sum_over_batch_size = True  # pylint: disable=protected-access
     return loss
 
+  def _should_broadcast(self, obj):
+    return not nest.is_nested(obj)
 
-class MetricsContainer(object):
+  def _copy_object(self, obj):
+    return obj  # Losses don't need to be copied.
+
+
+class MetricsContainer(Container):
   """A container class for metrics passed to `Model.compile`."""
 
   def __init__(self, metrics=None, weighted_metrics=None, output_names=None):
+    super(MetricsContainer, self).__init__(output_names=output_names)
+
     # Keep user-supplied values untouched for recompiling and serialization.
     self._user_metrics = metrics
     self._user_weighted_metrics = weighted_metrics
 
     self._metrics = metrics
     self._weighted_metrics = weighted_metrics
-    self._output_names = output_names
     self._built = False
 
   @property
   def metrics(self):
-    """Metrics created by this container."""
+    """All metrics in this container."""
     if not self._built:
       return []
     return self._metrics_in_order
 
-  def _build(self, y_pred, y_true):
+  @property
+  def unweighted_metrics(self):
+    """Metrics in this container that should not be passed `sample_weight`."""
+    if not self._built:
+      return None
+    return nest.flatten(self._metrics)
+
+  @property
+  def weighted_metrics(self):
+    """Metrics in this container that should be passed `sample_weight`."""
+    if not self._built:
+      return None
+    return nest.flatten(self._weighted_metrics)
+
+  def build(self, y_pred, y_true):
     """One-time setup of metric objects."""
+    super(MetricsContainer, self).build(y_pred)
 
-    if self._output_names is None:
-      # Subclass output names like 'output_1' are used for `Metric` names.
-      self._output_names = create_pseudo_output_names(y_pred)
+    self._metrics = self._maybe_broadcast_to_outputs(y_pred, self._metrics)
+    self._metrics = self._conform_to_outputs(y_pred, self._metrics)
 
-    # If a single metric or flat list of metrics, apply to all outputs.
-    self._metrics = self._maybe_broadcast(self._metrics, y_pred)
-    self._weighted_metrics = self._maybe_broadcast(self._weighted_metrics,
-                                                   y_pred)
-
-    # Accept a dict of metrics keyed by output_name when outputs are a flat
-    # list.
-    self._metrics = map_to_output_names(y_pred, self._output_names,
-                                        self._metrics)
-    self._weighted_metrics = map_to_output_names(y_pred, self._output_names,
-                                                 self._weighted_metrics)
+    self._weighted_metrics = self._maybe_broadcast_to_outputs(
+        y_pred, self._weighted_metrics)
+    self._weighted_metrics = self._conform_to_outputs(y_pred,
+                                                      self._weighted_metrics)
 
     # Standardize on tuple since `tf.data` turns lists into `Tensor`s.
-    # pylint: disable=protected-access
-    y_pred = nest._list_to_tuple(y_pred)
-    y_true = nest._list_to_tuple(y_true)
-    self._metrics = nest._list_to_tuple(self._metrics)
-    self._weighted_metrics = nest._list_to_tuple(self._weighted_metrics)
-    # pylint: enable=protected-access
+    y_pred = nest.list_to_tuple(y_pred)
+    y_true = nest.list_to_tuple(y_true)
+    self._metrics = nest.list_to_tuple(self._metrics)
+    self._weighted_metrics = nest.list_to_tuple(self._weighted_metrics)
 
     # Convert to `Metric` objects, potentially disambiguating based on output
     # properties.
@@ -276,18 +349,7 @@ class MetricsContainer(object):
 
     # Assumes metrics, weighted_metrics have been flattened up to outputs.
     self._set_metric_names()
-
-    # Cache the flat order needed when returning metrics, for backwards compat.
-    self._metrics_in_order = []
-    for output_metrics, output_weighted_metrics in zip(self._metrics,
-                                                       self._weighted_metrics):
-      for m in nest.flatten(output_metrics):
-        if m is not None:
-          self._metrics_in_order.append(m)
-      for wm in nest.flatten(output_weighted_metrics):
-        if wm is not None:
-          self._metrics_in_order.append(wm)
-
+    self._create_ordered_metrics()
     self._built = True
 
   def _set_metric_names(self):
@@ -326,45 +388,46 @@ class MetricsContainer(object):
         metric_names.add(wm._name)
     # pylint: enable=protected-access
 
+  def _create_ordered_metrics(self):
+    """Cache the flat order needed when returning metrics, for backwards compat."""
+    self._metrics_in_order = []
+    for output_metrics, output_weighted_metrics in zip(self._metrics,
+                                                       self._weighted_metrics):
+      for m in nest.flatten(output_metrics):
+        if m is not None:
+          self._metrics_in_order.append(m)
+      for wm in nest.flatten(output_weighted_metrics):
+        if wm is not None:
+          self._metrics_in_order.append(wm)
+
   def update_state(self, y_true, y_pred, sample_weight=None):
     """Updates the state of per-output metrics."""
-    y_true = map_to_output_names(y_pred, self._output_names, y_true)
-    sample_weight = map_to_output_names(y_pred, self._output_names,
-                                        sample_weight)
-
-    flat_y_true = nest.flatten(y_true) if y_true is not None else []
-    flat_y_pred = nest.flatten(y_pred)
-
-    if not flat_y_true:
-      return  # Handle case where no targets are passed.
-
-    # TODO(omalleyt): Remove ambiguity here (see LossesContainer).
-    if len(flat_y_true) == 1 and len(flat_y_pred) > 1:
-      y_true = nest.map_structure(lambda _: flat_y_true[0], y_pred)
-      flat_y_true = nest.flatten(y_true)
+    y_true = self._conform_to_outputs(y_pred, y_true)
+    sample_weight = self._conform_to_outputs(y_pred, sample_weight)
 
     if not self._built:
-      # `_build` needs unflattened outputs and labels.
-      self._build(y_pred, y_true)
+      self.build(y_pred, y_true)
 
-    y_true = flat_y_true
-    y_pred = flat_y_pred
-
+    y_pred = nest.flatten(y_pred)
+    y_true = nest.flatten(y_true) if y_true is not None else []
     sample_weight = nest.flatten(sample_weight)
-    # Allows passing one sample-weight array for all outputs.
-    if len(sample_weight) == 1 and len(y_pred) > 1:
-      sample_weight = sample_weight * len(y_pred)
 
     zip_args = (y_true, y_pred, sample_weight, self._metrics,
                 self._weighted_metrics)
     for y_t, y_p, sw, metric_objs, weighted_metric_objs in zip(*zip_args):
+      # Ok to have no metrics for an output.
+      if (y_t is None or (all(m is None for m in metric_objs) and
+                          all(wm is None for wm in weighted_metric_objs))):
+        continue
+
       y_t, y_p, sw = match_dtype_and_rank(y_t, y_p, sw)
-      sw = apply_mask(y_p, sw)
+      mask = get_mask(y_p)
+      sw = apply_mask(y_p, sw, mask)
 
       for metric_obj in metric_objs:
         if metric_obj is None:
           continue
-        metric_obj.update_state(y_t, y_p)
+        metric_obj.update_state(y_t, y_p, sample_weight=mask)
 
       for weighted_metric_obj in weighted_metric_objs:
         if weighted_metric_obj is None:
@@ -379,7 +442,7 @@ class MetricsContainer(object):
   def _get_metric_object(self, metric, y_t, y_p):
     """Converts user-supplied metric to a `Metric` object.
 
-    Arguments:
+    Args:
       metric: A string, function, or `Metric` object.
       y_t: Sample of label.
       y_p: Sample of output.
@@ -419,43 +482,34 @@ class MetricsContainer(object):
         else:
           metric_obj = metrics_mod.categorical_crossentropy
 
+    if isinstance(metric_obj, losses_mod.Loss):
+      metric_obj._allow_sum_over_batch_size = True  # pylint: disable=protected-access
+
     if not isinstance(metric_obj, metrics_mod.Metric):
       if isinstance(metric, six.string_types):
         metric_name = metric
-      elif hasattr(metric, 'name'):
-        metric_name = metric.name  # TODO(omalleyt): Is this needed?
       else:
-        # function was passed.
-        metric_name = metric.__name__
+        metric_name = get_custom_object_name(metric)
+        if metric_name is None:
+          raise ValueError(
+              'Metric should be a callable, found: {}'.format(metric))
 
       metric_obj = metrics_mod.MeanMetricWrapper(metric_obj, name=metric_name)
 
     return metric_obj
 
-  def _maybe_broadcast(self, metrics, y_pred):
-    """If a flat list of Metrics is supplied, apply them to all outputs."""
+  def _should_broadcast(self, obj):
+    # e.g. 'mse'.
+    if not nest.is_nested(obj):
+      return True
+    # e.g. ['mse'] or ['mse', 'mae'].
+    return (isinstance(obj, (list, tuple)) and
+            not any(nest.is_nested(o) for o in obj))
 
-    def _should_broadcast(metrics):
-      # e.g. 'mse'.
-      if not nest.is_sequence(metrics):
-        return True
-      # e.g. ['mse'] or ['mse', 'mae'].
-      return (isinstance(metrics, (list, tuple)) and
-              not any(nest.is_sequence(m) for m in metrics))
-
-    if _should_broadcast(metrics):
-      copy_metrics = len(nest.flatten(y_pred)) > 1
-
-      def _maybe_copy(m):
-        if copy_metrics and isinstance(m, metrics_mod.Metric):
-          return m.__class__.from_config(m.get_config())
-        return m
-
-      metrics = nest.flatten(metrics)
-      return nest.map_structure(lambda _: [_maybe_copy(m) for m in metrics],
-                                y_pred)
-
-    return metrics
+  def _copy_object(self, obj):
+    if isinstance(obj, metrics_mod.Metric):
+      return obj.__class__.from_config(obj.get_config())
+    return obj  # Can be a function or `None`.
 
 
 def create_pseudo_output_names(outputs):
@@ -485,7 +539,7 @@ def _create_pseudo_names(tensors, prefix):
   `[x, y]` becomes:
   `['output_1', 'output_2']`
 
-  Arguments:
+  Args:
     tensors: `Model`'s outputs or inputs.
     prefix: 'output_' for outputs, 'input_' for inputs.
 
@@ -530,7 +584,7 @@ def map_to_output_names(y_pred, output_names, struct):
   This mapping preserves backwards compatibility for `compile` and
   `fit`.
 
-  Arguments:
+  Args:
     y_pred: Sample outputs of the Model, to determine if this convenience
       feature should be applied (`struct` is returned unmodified if `y_pred`
       isn't a flat list).
@@ -540,10 +594,10 @@ def map_to_output_names(y_pred, output_names, struct):
   Returns:
     `struct` mapped to a list in same order as `output_names`.
   """
-  outputs_are_flat_list = (
-      isinstance(y_pred, (list, tuple)) and
-      not any(nest.is_sequence(y_p) for y_p in y_pred))
-  single_output = not nest.is_sequence(y_pred)
+  single_output = not nest.is_nested(y_pred)
+  outputs_are_flat_list = (not single_output and
+                           isinstance(y_pred, (list, tuple)) and
+                           not any(nest.is_nested(y_p) for y_p in y_pred))
 
   if (single_output or outputs_are_flat_list) and isinstance(struct, dict):
     output_names = output_names or create_pseudo_output_names(y_pred)
@@ -560,35 +614,68 @@ def map_to_output_names(y_pred, output_names, struct):
     return struct
 
 
+def map_missing_dict_keys(y_pred, struct):
+  """Replaces missing dict keys in `struct` with `None` placeholders."""
+  if not isinstance(y_pred, dict) or not isinstance(struct, dict):
+    return struct
+  for k in y_pred.keys():
+    if k not in struct:
+      struct[k] = None
+  return struct
+
+
 def match_dtype_and_rank(y_t, y_p, sw):
   """Match dtype and rank of predictions."""
-  # Rank.
-  y_t_rank = len(y_t.shape)
-  y_p_rank = len(y_p.shape)
-  if y_t_rank == 1 and y_p_rank == 2:
+  if y_t.shape.rank == 1 and y_p.shape.rank == 2:
     y_t = array_ops.expand_dims_v2(y_t, axis=-1)
   if sw is not None:
-    sw_rank = len(sw.shape)
-    if sw_rank == 1 and y_p_rank == 2:
+    if sw.shape.rank == 1 and y_p.shape.rank == 2:
       sw = array_ops.expand_dims_v2(sw, axis=-1)
 
   # Dtype.
-  y_t = math_ops.cast(y_t, y_p.dtype)
+  # This is required mainly for custom loss functions which do not take care
+  # casting dtypes.
+  if ((y_t.dtype.is_floating and y_p.dtype.is_floating) or
+      (y_t.dtype.is_integer and y_p.dtype.is_integer)):
+    y_t = math_ops.cast(y_t, y_p.dtype)
+
   if sw is not None:
     sw = math_ops.cast(sw, y_p.dtype)
   return y_t, y_p, sw
 
 
-def apply_mask(y_p, sw):
+def get_mask(y_p):
+  """Returns Keras mask from tensor."""
+  return getattr(y_p, '_keras_mask', None)
+
+
+def apply_mask(y_p, sw, mask):
   """Applies any mask on predictions to sample weights."""
-  # Handle Keras mask on outputs.
-  mask = getattr(y_p, '_keras_mask', None)
   if mask is not None:
     mask = math_ops.cast(mask, y_p.dtype)
     if sw is not None:
       mask, _, sw = (
-          tf_losses_utils.squeeze_or_expand_dimensions(mask, sample_weight=sw))
+          losses_utils.squeeze_or_expand_dimensions(mask, sample_weight=sw))
       sw *= mask
     else:
       sw = mask
   return sw
+
+
+def get_custom_object_name(obj):
+  """Returns the name to use for a custom loss or metric callable.
+
+  Args:
+    obj: Custom loss of metric callable
+
+  Returns:
+    Name to use, or `None` if the object was not recognized.
+  """
+  if hasattr(obj, 'name'):  # Accept `Loss` instance as `Metric`.
+    return obj.name
+  elif hasattr(obj, '__name__'):  # Function.
+    return obj.__name__
+  elif hasattr(obj, '__class__'):  # Class instance.
+    return generic_utils.to_snake_case(obj.__class__.__name__)
+  else:  # Unrecognized object.
+    return None

@@ -19,7 +19,6 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
-import collections
 import contextlib
 import functools
 import itertools
@@ -32,40 +31,40 @@ import six
 from tensorflow.python.data.experimental.ops import cardinality
 from tensorflow.python.data.experimental.ops import distribute_options
 from tensorflow.python.data.ops import dataset_ops
+from tensorflow.python.data.ops import iterator_ops
 from tensorflow.python.distribute import distribution_strategy_context as ds_context
+from tensorflow.python.distribute import input_lib
+from tensorflow.python.eager import context
+from tensorflow.python.eager import monitoring
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import smart_cond
 from tensorflow.python.framework import sparse_tensor
 from tensorflow.python.framework import tensor_shape
-from tensorflow.python.framework.ops import composite_tensor
 from tensorflow.python.keras import backend
 from tensorflow.python.keras.engine import training_utils
 from tensorflow.python.keras.utils import data_utils
+from tensorflow.python.keras.utils import tf_utils
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import script_ops
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import nest
+from tensorflow.python.util.tf_export import keras_export
+
+keras_data_adapter_gauge = monitoring.BoolGauge(
+    "/tensorflow/api/keras/data_adapters", "keras data adapter usage", "method")
 
 try:
   from scipy import sparse as scipy_sparse  # pylint: disable=g-import-not-at-top
 except ImportError:
   scipy_sparse = None
-
 try:
   import pandas as pd  # pylint: disable=g-import-not-at-top
 except ImportError:
   pd = None
-
-try:
-  # In Python2 unicode is a scalar type
-  scalar_types = (float, int, str, unicode)
-except NameError:
-  # In Python3 unicode is not present, it always uses string
-  scalar_types = (float, int, str)
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -223,6 +222,10 @@ class DataAdapter(object):
       total_sample -= (self.batch_size() - self.partial_batch_size())
     return total_sample
 
+  def on_epoch_end(self):
+    """A hook called after each epoch."""
+    pass
+
 
 class TensorLikeDataAdapter(DataAdapter):
   """Adapter that handles Tensor-like objects, e.g. EagerTensor and NumPy."""
@@ -267,15 +270,8 @@ class TensorLikeDataAdapter(DataAdapter):
 
     inputs = pack_x_y_sample_weight(x, y, sample_weights)
 
-    num_samples = set(int(i.shape[0]) for i in nest.flatten(inputs))
-    if len(num_samples) > 1:
-      msg = "Data cardinality is ambiguous:\n"
-      for label, data in zip(["x", "y", "sample_weight"], inputs):
-        msg += "  {} sizes: {}\n".format(
-            label, ", ".join(str(i.shape[0]) for i in nest.flatten(data)))
-      msg += "Please provide data which shares the same first dimension."
-      raise ValueError(msg)
-    num_samples = num_samples.pop()
+    num_samples = set(int(i.shape[0]) for i in nest.flatten(inputs)).pop()
+    _check_data_cardinality(inputs)
 
     # If batch_size is not passed but steps is, calculate from the input data.
     # Default to 32 for backwards compat.
@@ -425,8 +421,8 @@ class TensorLikeDataAdapter(DataAdapter):
 class GenericArrayLikeDataAdapter(TensorLikeDataAdapter):
   """Adapter that handles array-like data without forcing it into memory.
 
-  As an example, this adapter handles `keras.utils.HDF5Matrix` which holds
-  datasets that may be too big to fully fit into memory.
+  This adapter handles array-like datasets that may be too big to fully
+  fit into memory.
 
   Specifically, this adapter handles any Python class which implements:
   `__get_item__`, `__len__`, `shape`, and `dtype` with the same meanings
@@ -528,9 +524,11 @@ class CompositeTensorDataAdapter(DataAdapter):
       flat_inputs += nest.flatten(y)
 
     def _is_composite(v):
-      # Dataset inherits from CompositeTensor but shouldn't be handled here.
-      if (isinstance(v, composite_tensor.CompositeTensor) and
-          not isinstance(v, dataset_ops.DatasetV2)):
+      # Dataset/iterator inherits from CompositeTensor but should be handled
+      # by DatasetAdapter and GeneratorAdapter.
+      if (tf_utils.is_extension_type(v) and
+          not isinstance(v, (dataset_ops.DatasetV2,
+                             iterator_ops.IteratorBase))):
         return True
       # Support Scipy sparse tensors if scipy is installed
       if scipy_sparse is not None and scipy_sparse.issparse(v):
@@ -619,9 +617,9 @@ class ListsOfScalarsDataAdapter(DataAdapter):
 
   @staticmethod
   def _is_list_of_scalars(inp):
-    if isinstance(inp, scalar_types):
+    if isinstance(inp, (float, int, str, bytes, bytearray)):
       return True
-    if isinstance(inp, (list, tuple)):
+    if isinstance(inp, (list, tuple)) and inp:
       return ListsOfScalarsDataAdapter._is_list_of_scalars(inp[0])
     return False
 
@@ -675,7 +673,8 @@ class DatasetAdapter(DataAdapter):
 
   @staticmethod
   def can_handle(x, y=None):
-    return isinstance(x, (dataset_ops.DatasetV1, dataset_ops.DatasetV2))
+    return (isinstance(x, (dataset_ops.DatasetV1, dataset_ops.DatasetV2)) or
+            _is_distributed_dataset(x))
 
   def __init__(self,
                x,
@@ -709,6 +708,11 @@ class DatasetAdapter(DataAdapter):
     return None
 
   def should_recreate_iterator(self):
+    # Since DistributedDatasets have no cardinality, the user must provide
+    # all steps that need to be run, calling `.repeat()` as needed.
+    if _is_distributed_dataset(self._dataset):
+      return False
+
     # If user doesn't supply `steps`, or if they supply `steps` that
     # exactly equals the size of the `Dataset`, create a new iterator
     # each epoch.
@@ -725,10 +729,18 @@ class DatasetAdapter(DataAdapter):
       raise ValueError("`sample_weight` argument is not supported when using "
                        "dataset as input.")
 
-    size = cardinality.cardinality(self._dataset).numpy()
-    if size == cardinality.INFINITE and steps is None:
-      raise ValueError("When providing an infinite dataset, you must specify "
-                       "the number of steps to run.")
+    if steps is None:
+      if _is_distributed_dataset(self._dataset):
+        raise ValueError("When providing a distributed dataset, you must "
+                         "specify the number of steps to run.")
+
+      size = cardinality.cardinality(self._dataset).numpy()
+      if size == cardinality.INFINITE and steps is None:
+        raise ValueError(
+            "When providing an infinite dataset, you must specify "
+            "the number of steps to run (if you did not intend to "
+            "create an infinite dataset, make sure to not call "
+            "`repeat()` on the dataset).")
 
 
 class GeneratorDataAdapter(DataAdapter):
@@ -765,14 +777,13 @@ class GeneratorDataAdapter(DataAdapter):
     # Since we have to know the dtype of the python generator when we build the
     # dataset, we have to look at a batch to infer the structure.
     peek, x = self._peek_and_restore(x)
-    assert_not_namedtuple(peek)
     peek = self._standardize_batch(peek)
     peek = _process_tensorlike(peek)
 
     # Need to build the Model on concrete input shapes.
     if model is not None and not model.built:
       concrete_x, _, _ = unpack_x_y_sample_weight(peek)
-      model.distribute_strategy.experimental_run_v2(
+      model.distribute_strategy.run(
           lambda x: model(x, training=False), args=(concrete_x,))
 
     self._first_batch_size = int(nest.flatten(peek)[0].shape[0])
@@ -810,7 +821,7 @@ class GeneratorDataAdapter(DataAdapter):
     x, y, sample_weight = unpack_x_y_sample_weight(data)
     data = pack_x_y_sample_weight(x, y, sample_weight)
 
-    data = nest._list_to_tuple(data)  # pylint: disable=protected-access
+    data = nest.list_to_tuple(data)
 
     def _convert_dtype(t):
       if (isinstance(t, np.ndarray) and issubclass(t.dtype.type, np.floating)):
@@ -829,11 +840,6 @@ class GeneratorDataAdapter(DataAdapter):
                               max_queue_size):
     """Create a callable, possibly including an Enqueuer."""
     if workers > 1 or (workers > 0 and use_multiprocessing):
-      if use_multiprocessing:
-        logging.warning(
-            UserWarning("Using a generator with `use_multiprocessing=True` "
-                        "and multiple workers may duplicate your data. "
-                        "Please consider using the `tf.data.Dataset`."))
       def generator_fn():
         enqueuer = data_utils.GeneratorEnqueuer(
             x, use_multiprocessing=use_multiprocessing)
@@ -891,6 +897,8 @@ class KerasSequenceAdapter(GeneratorDataAdapter):
 
     self._size = len(x)
     self._shuffle_sequence = shuffle
+    self._keras_sequence = x
+    self._enqueuer = None
     super(KerasSequenceAdapter, self).__init__(
         x,
         shuffle=False,  # Shuffle is handed in the _make_callable override.
@@ -908,11 +916,11 @@ class KerasSequenceAdapter(GeneratorDataAdapter):
                               max_queue_size):
     if workers > 1 or (workers > 0 and use_multiprocessing):
       def generator_fn():
-        enqueuer = data_utils.OrderedEnqueuer(
+        self._enqueuer = data_utils.OrderedEnqueuer(
             x, use_multiprocessing=use_multiprocessing,
             shuffle=self._shuffle_sequence)
-        enqueuer.start(workers=workers, max_queue_size=max_queue_size)
-        return enqueuer.get()
+        self._enqueuer.start(workers=workers, max_queue_size=max_queue_size)
+        return self._enqueuer.get()
     else:
       def generator_fn():
         order = range(len(x))
@@ -931,6 +939,11 @@ class KerasSequenceAdapter(GeneratorDataAdapter):
 
   def should_recreate_iterator(self):
     return True
+
+  def on_epoch_end(self):
+    if self._enqueuer:
+      self._enqueuer.stop()
+    self._keras_sequence.on_epoch_end()
 
 
 ALL_ADAPTER_CLS = [
@@ -955,6 +968,8 @@ def select_data_adapter(x, y):
         "handling inputs. Found multiple adapters {} to handle "
         "input: {}, {}".format(
             adapter_cls, _type_name(x), _type_name(y)))
+  # Instrument the data adapter usage before returning it
+  keras_data_adapter_gauge.get_cell(adapter_cls[0].__name__).set(True)
   return adapter_cls[0]
 
 
@@ -993,13 +1008,13 @@ def _process_tensorlike(inputs):
       dtype = None
       if issubclass(x.dtype.type, np.floating):
         dtype = backend.floatx()
-      return ops.convert_to_tensor(x, dtype=dtype)
+      return ops.convert_to_tensor_v2_with_dispatch(x, dtype=dtype)
     elif scipy_sparse and scipy_sparse.issparse(x):
       return _scipy_sparse_to_sparse_tensor(x)
     return x
 
   inputs = nest.map_structure(_convert_numpy_and_scipy, inputs)
-  return nest._list_to_tuple(inputs)  # pylint: disable=protected-access
+  return nest.list_to_tuple(inputs)
 
 
 def is_none_or_empty(inputs):
@@ -1047,21 +1062,6 @@ def broadcast_sample_weight_modes(target_structure, sample_weight_modes):
   return sample_weight_modes
 
 
-def assert_not_namedtuple(x):
-  if (isinstance(x, tuple) and
-      # TODO(b/144192902): Use a namedtuple checking utility.
-      hasattr(x, "_fields") and
-      isinstance(x._fields, collections.Sequence) and
-      all(isinstance(f, six.string_types) for f in x._fields)):
-    raise ValueError(
-        "Received namedtuple ({}) with fields `{}` as input. namedtuples "
-        "cannot, in general, be unambiguously resolved into `x`, `y`, "
-        "and `sample_weight`. For this reason Keras has elected not to "
-        "support them. If you would like the value to be unpacked, "
-        "please explicitly convert it to a tuple before passing it to "
-        "Keras.".format(x.__class__, x._fields))
-
-
 class DataHandler(object):
   """Handles iterating over epoch-level `tf.data.Iterator` objects."""
 
@@ -1078,14 +1078,49 @@ class DataHandler(object):
                max_queue_size=10,
                workers=1,
                use_multiprocessing=False,
-               model=None):
+               model=None,
+               steps_per_execution=None,
+               distribute=True):
+    """Initializes a `DataHandler`.
+
+    Arguments:
+      x: See `Model.fit`.
+      y: See `Model.fit`.
+      sample_weight: See `Model.fit`.
+      batch_size: See `Model.fit`.
+      steps_per_epoch: See `Model.fit`.
+      initial_epoch: See `Model.fit`.
+      epochs: See `Model.fit`.
+      shuffle: See `Model.fit`.
+      class_weight: See `Model.fit`.
+      max_queue_size: See `Model.fit`.
+      workers: See `Model.fit`.
+      use_multiprocessing: See `Model.fit`.
+      model: The `Model` instance. Needed in order to correctly `build` the
+        `Model` using generator-like inputs (see `GeneratorDataAdapter`).
+      steps_per_execution: See `Model.compile`.
+      distribute: Whether to distribute the `tf.dataset`.
+        `PreprocessingLayer.adapt` does not support distributed datasets,
+        `Model` should always set this to `True`.
+    """
 
     self._initial_epoch = initial_epoch
     self._epochs = epochs
     self._insufficient_data = False
+    self._model = model
 
-    train_adapter_cls = select_data_adapter(x, y)
-    self._train_adapter = train_adapter_cls(
+    # `steps_per_execution_value` is the cached initial value.
+    # `steps_per_execution` is mutable and may be changed by the DataAdapter
+    # to handle partial executions.
+    if steps_per_execution is None:
+      self._steps_per_execution = 1
+      self._steps_per_execution_value = 1
+    else:
+      self._steps_per_execution = steps_per_execution
+      self._steps_per_execution_value = steps_per_execution.numpy().item()
+
+    adapter_cls = select_data_adapter(x, y)
+    self._adapter = adapter_cls(
         x,
         y,
         batch_size=batch_size,
@@ -1100,33 +1135,61 @@ class DataHandler(object):
         model=model)
 
     strategy = ds_context.get_strategy()
-    dataset = self._train_adapter.get_dataset()
+    dataset = self._adapter.get_dataset()
     if class_weight:
       dataset = dataset.map(_make_class_weight_map_fn(class_weight))
-    self._steps_per_epoch = self._infer_steps(steps_per_epoch, dataset)
-    self._train_dataset = strategy.experimental_distribute_dataset(dataset)
+    self._inferred_steps = self._infer_steps(steps_per_epoch, dataset)
+
+    # `PreprocessingLayer.adapt` does not currently support distributed
+    # datasets, so we pass `distribute=False` there.
+    if distribute and not _is_distributed_dataset(dataset):
+      dataset = strategy.experimental_distribute_dataset(dataset)
+    self._dataset = dataset
+
+    self._current_step = 0
+    self._step_increment = self._steps_per_execution_value - 1
+    self._insufficient_data = False
+
+    self._validate_data_handler()
 
   def enumerate_epochs(self):
     """Yields `(epoch, tf.data.Iterator)`."""
-    data_iterator = iter(self._train_dataset)
-    for epoch in range(self._initial_epoch, self._epochs):
-      if self._insufficient_data:  # Set by `catch_stop_iteration`.
-        break
-      if self._train_adapter.should_recreate_iterator():
-        data_iterator = iter(self._train_dataset)
-      yield epoch, data_iterator
+    with self._truncate_execution_to_epoch():
+      data_iterator = iter(self._dataset)
+      for epoch in range(self._initial_epoch, self._epochs):
+        if self._insufficient_data:  # Set by `catch_stop_iteration`.
+          break
+        if self._adapter.should_recreate_iterator():
+          data_iterator = iter(self._dataset)
+        yield epoch, data_iterator
+        self._adapter.on_epoch_end()
+
+  @contextlib.contextmanager
+  def _truncate_execution_to_epoch(self):
+    """Truncates steps per execution to at most one epoch."""
+    should_truncate = (
+        self._inferred_steps is not None and
+        self._steps_per_execution_value > self._inferred_steps)
+    original_value = self._steps_per_execution_value
+    try:
+      if should_truncate:
+        self._steps_per_execution.assign(self._inferred_steps)
+        self._steps_per_execution_value = self._inferred_steps
+      yield
+    finally:
+      if should_truncate:
+        self._steps_per_execution.assign(original_value)
+        self._steps_per_execution_value = original_value
 
   @contextlib.contextmanager
   def catch_stop_iteration(self):
     """Catches errors when an iterator runs out of data."""
     try:
       yield
+      context.async_wait()
     except (StopIteration, errors.OutOfRangeError):
-      if (self._train_adapter.get_size() is None and
-          self._steps_per_epoch is None and self._current_step > 0):
-        # The input passed by the user ran out of batches.
-        # Now we know the cardinality of the input(dataset or generator).
-        self._steps_per_epoch = self._current_step
+      if self._inferred_steps is None:
+        self._inferred_steps = self._current_step
       else:
         self._insufficient_data = True
         total_epochs = self._epochs - self._initial_epoch
@@ -1136,50 +1199,91 @@ class DataHandler(object):
             "least `steps_per_epoch * epochs` batches (in this case, "
             "{} batches). You may need to use the repeat() function "
             "when building your dataset.".format(total_epochs *
-                                                 self._steps_per_epoch))
+                                                 self._inferred_steps))
 
   def steps(self):
     """Yields steps for the current epoch."""
     self._current_step = 0
-    # `self._steps_per_epoch` can be changed by `catch_stop_iteration`.
-    while (self._steps_per_epoch is None or
-           self._current_step < self._steps_per_epoch):
+    # `self._inferred_steps` can be changed by `catch_stop_iteration`.
+    while (self._inferred_steps is None or
+           self._current_step < self._inferred_steps):
       if self._insufficient_data:  # Set by `catch_stop_iteration`.
         break
-      yield self._current_step
-      self._current_step += 1
+
+      can_run_full_execution = (
+          self._steps_per_execution_value == 1 or
+          self._inferred_steps is None or
+          self._inferred_steps - self._current_step >=
+          self._steps_per_execution_value)
+
+      if can_run_full_execution:
+        self._step_increment = self._steps_per_execution_value - 1
+        yield self._current_step
+        self._current_step += self._steps_per_execution_value
+      else:
+        # Last partial execution.
+        steps_remaining = self._inferred_steps - self._current_step
+        self._steps_per_execution.assign(steps_remaining)
+        self._step_increment = steps_remaining - 1
+        yield self._current_step
+        self._current_step += steps_remaining
+        self._steps_per_execution.assign(self._steps_per_execution_value)
+
+  @property
+  def step_increment(self):
+    """The number to increment the step for `on_batch_end` methods."""
+    return self._step_increment
+
+  @property
+  def inferred_steps(self):
+    """The inferred steps per epoch of the created `Dataset`.
+
+    This will be `None` in the case where:
+
+    (1) A `Dataset` of unknown cardinality was passed to the `DataHandler`, and
+    (2) `steps_per_epoch` was not provided, and
+    (3) The first epoch of iteration has not yet completed.
+
+    Returns:
+      The inferred steps per epoch of the created `Dataset`.
+    """
+    return self._inferred_steps
+
+  @property
+  def should_sync(self):
+    # Catch OutOfRangeError for Datasets of unknown size.
+    # This blocks until the batch has finished executing.
+    # TODO(b/150292341): Allow multiple async steps here.
+    return self._inferred_steps is None
 
   def _infer_steps(self, steps, dataset):
     """Infers steps_per_epoch needed to loop through a dataset."""
     if steps is not None:
       return steps
 
-    adapter_steps = self._train_adapter.get_size()
+    adapter_steps = self._adapter.get_size()
     if adapter_steps is not None:
       return adapter_steps
-
-    if (ds_context.get_strategy().extended._in_multi_worker_mode() and  # pylint: disable=protected-access
-        (dataset.options().experimental_distribute.auto_shard_policy !=
-         distribute_options.AutoShardPolicy.OFF)):
-      # If the dataset would be auto-sharded, we should not infer a local
-      # steps_per_epoch due to the possible inbalanced sharding between workers.
-      return None
 
     size = cardinality.cardinality(dataset)
     if size == cardinality.INFINITE and steps is None:
       raise ValueError("When passing an infinitely repeating dataset, you "
                        "must specify how many steps to draw.")
     if size >= 0:
-      return size
+      return size.numpy().item()
     return None
 
   @property
   def _samples(self):
-    return self._train_adapter.get_samples()
+    return self._adapter.get_samples()
 
-  @property
-  def _steps(self):
-    return self._train_adapter.get_size()
+  def _validate_data_handler(self):
+    # TODO(b/152094471): Support this with DistIter.get_next_as_optional.
+    if self._steps_per_execution_value > 1 and self._inferred_steps is None:
+      raise ValueError(
+          "Could not infer the size of the data. With "
+          "`steps_per_execution > 1`, you must specify the number of steps "
+          "to run.")
 
 
 def _make_class_weight_map_fn(class_weight):
@@ -1188,7 +1292,7 @@ def _make_class_weight_map_fn(class_weight):
   The `Dataset` is assumed to be in format `(x, y)` or `(x, y, sw)`, where
   `y` must be a single `Tensor`.
 
-  Arguments:
+  Args:
     class_weight: A map where the keys are integer class ids and values are
       the class weights, e.g. `{0: 0.2, 1: 0.6, 2: 0.3}`
 
@@ -1204,14 +1308,14 @@ def _make_class_weight_map_fn(class_weight):
         "than the number of classes, found {}").format(class_weight)
     raise ValueError(error_msg)
 
-  class_weight_tensor = ops.convert_to_tensor_v2(
-      [int(class_weight[c]) for c in class_ids], dtype="int64")
+  class_weight_tensor = ops.convert_to_tensor_v2_with_dispatch(
+      [class_weight[int(c)] for c in class_ids])
 
   def _class_weights_map_fn(*data):
     """Convert `class_weight` to `sample_weight`."""
     x, y, sw = unpack_x_y_sample_weight(data)
 
-    if nest.is_sequence(y):
+    if nest.is_nested(y):
       raise ValueError(
           "`class_weight` is only supported for Models with a single output.")
 
@@ -1242,7 +1346,8 @@ def expand_1d(data):
   """Expands 1-dimensional `Tensor`s into 2-dimensional `Tensor`s."""
 
   def _expand_single_1d_tensor(t):
-    if (hasattr(t, "shape") and
+    # Leaves `CompositeTensor`s as-is.
+    if (isinstance(t, ops.Tensor) and
         isinstance(t.shape, tensor_shape.TensorShape) and t.shape.rank == 1):
       return array_ops.expand_dims_v2(t, axis=-1)
     return t
@@ -1250,19 +1355,17 @@ def expand_1d(data):
   return nest.map_structure(_expand_single_1d_tensor, data)
 
 
-def train_validation_split(arrays, validation_split, shuffle=True):
-  """Split arrays into random train and validation subsets.
+def train_validation_split(arrays, validation_split):
+  """Split arrays into train and validation subsets in deterministic order.
 
-  Arguments:
+  The last part of data will become validation data.
+
+  Args:
     arrays: Tensors to split. Allowed inputs are arbitrarily nested structures
       of Tensors and NumPy arrays.
     validation_split: Float between 0 and 1. The proportion of the dataset to
       include in the validation split. The rest of the dataset will be included
       in the training split.
-    shuffle: Bool. Whether to shuffle the data before performing a split. If
-      `False`, the last `validation_split` fraction of that training data will
-      become the validation split.
-
   Returns:
     `(train_arrays, validation_arrays)`
   """
@@ -1274,10 +1377,11 @@ def train_validation_split(arrays, validation_split, shuffle=True):
     return isinstance(t, tensor_types) or t is None
 
   flat_arrays = nest.flatten(arrays)
-  if not all(_can_split(t) for t in flat_arrays):
+  unsplitable = [type(t) for t in flat_arrays if not _can_split(t)]
+  if unsplitable:
     raise ValueError(
         "`validation_split` is only supported for Tensors or NumPy "
-        "arrays, found: {}".format(arrays))
+        "arrays, found following types in the input: {}".format(unsplitable))
 
   if all(t is None for t in flat_arrays):
     return arrays, arrays
@@ -1290,29 +1394,77 @@ def train_validation_split(arrays, validation_split, shuffle=True):
 
   # Assumes all arrays have the same batch shape or are `None`.
   batch_dim = int(first_non_none.shape[0])
-  indices = ops.convert_to_tensor_v2(range(batch_dim))
-  if shuffle:
-    indices = random_ops.random_shuffle(indices)
   split_at = int(math.floor(batch_dim * (1. - validation_split)))
-  train_indices = indices[:split_at]
-  val_indices = indices[split_at:]
 
-  def _split(t, indices):
+  if split_at == 0 or split_at == batch_dim:
+    raise ValueError(
+        "Training data contains {batch_dim} samples, which is not sufficient "
+        "to split it into a validation and training set as specified by "
+        "`validation_split={validation_split}`. Either provide more data, or a "
+        "different value for the `validation_split` argument." .format(
+            batch_dim=batch_dim, validation_split=validation_split))
+
+  def _split(t, start, end):
     if t is None:
       return t
-    t = ops.convert_to_tensor_v2(t)
-    return array_ops.gather_v2(t, indices)
+    return t[start:end]
 
   train_arrays = nest.map_structure(
-      functools.partial(_split, indices=train_indices), arrays)
+      functools.partial(_split, start=0, end=split_at), arrays)
   val_arrays = nest.map_structure(
-      functools.partial(_split, indices=val_indices), arrays)
+      functools.partial(_split, start=split_at, end=batch_dim), arrays)
 
   return train_arrays, val_arrays
 
 
+@keras_export("keras.utils.unpack_x_y_sample_weight", v1=[])
 def unpack_x_y_sample_weight(data):
-  """Unpacks user-provided data tuple."""
+  """Unpacks user-provided data tuple.
+
+  This is a convenience utility to be used when overriding
+  `Model.train_step`, `Model.test_step`, or `Model.predict_step`.
+  This utility makes it easy to support data of the form `(x,)`,
+  `(x, y)`, or `(x, y, sample_weight)`.
+
+  Standalone usage:
+
+  >>> features_batch = tf.ones((10, 5))
+  >>> labels_batch = tf.zeros((10, 5))
+  >>> data = (features_batch, labels_batch)
+  >>> # `y` and `sample_weight` will default to `None` if not provided.
+  >>> x, y, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+  >>> sample_weight is None
+  True
+
+  Example in overridden `Model.train_step`:
+
+  ```python
+  class MyModel(tf.keras.Model):
+
+    def train_step(self, data):
+      # If `sample_weight` is not provided, all samples will be weighted
+      # equally.
+      x, y, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+
+      with tf.GradientTape() as tape:
+        y_pred = self(x, training=True)
+        loss = self.compiled_loss(
+          y, y_pred, sample_weight, regularization_losses=self.losses)
+        trainable_variables = self.trainable_variables
+        gradients = tape.gradient(loss, trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, trainable_variables))
+
+      self.compiled_metrics.update_state(y, y_pred, sample_weight)
+      return {m.name: m.result() for m in self.metrics}
+  ```
+
+  Args:
+    data: A tuple of the form `(x,)`, `(x, y)`, or `(x, y, sample_weight)`.
+
+  Returns:
+    The unpacked tuple, with `None`s for `y` and `sample_weight` if they are not
+    provided.
+  """
   if not isinstance(data, tuple):
     return (data, None, None)
   elif len(data) == 1:
@@ -1321,14 +1473,48 @@ def unpack_x_y_sample_weight(data):
     return (data[0], data[1], None)
   elif len(data) == 3:
     return (data[0], data[1], data[2])
+  else:
+    error_msg = ("Data is expected to be in format `x`, `(x,)`, `(x, y)`, "
+                 "or `(x, y, sample_weight)`, found: {}").format(data)
+    raise ValueError(error_msg)
 
-  raise ValueError("Data not understood.")
 
-
+@keras_export("keras.utils.pack_x_y_sample_weight", v1=[])
 def pack_x_y_sample_weight(x, y=None, sample_weight=None):
-  """Packs user-provided data into a tuple."""
+  """Packs user-provided data into a tuple.
+
+  This is a convenience utility for packing data into the tuple formats
+  that `Model.fit` uses.
+
+  Standalone usage:
+
+  >>> x = tf.ones((10, 1))
+  >>> data = tf.keras.utils.pack_x_y_sample_weight(x)
+  >>> isinstance(data, tf.Tensor)
+  True
+  >>> y = tf.ones((10, 1))
+  >>> data = tf.keras.utils.pack_x_y_sample_weight(x, y)
+  >>> isinstance(data, tuple)
+  True
+  >>> x, y = data
+
+  Args:
+    x: Features to pass to `Model`.
+    y: Ground-truth targets to pass to `Model`.
+    sample_weight: Sample weight for each element.
+
+  Returns:
+    Tuple in the format used in `Model.fit`.
+  """
   if y is None:
-    return (x,)
+    # For single x-input, we do no tuple wrapping since in this case
+    # there is no ambiguity. This also makes NumPy and Dataset
+    # consistent in that the user does not have to wrap their Dataset
+    # data in an unecessary tuple
+    if not nest.is_nested(x):
+      return x
+    else:
+      return (x,)
   elif sample_weight is None:
     return (x, y)
   else:
@@ -1349,11 +1535,23 @@ def single_batch_iterator(strategy,
   else:
     data = (x, y, sample_weight)
 
+  _check_data_cardinality(data)
   dataset = dataset_ops.DatasetV2.from_tensors(data)
   if class_weight:
     dataset = dataset.map(_make_class_weight_map_fn(class_weight))
   dataset = strategy.experimental_distribute_dataset(dataset)
   return iter(dataset)
+
+
+def _check_data_cardinality(data):
+  num_samples = set(int(i.shape[0]) for i in nest.flatten(data))
+  if len(num_samples) > 1:
+    msg = "Data cardinality is ambiguous:\n"
+    for label, single_data in zip(["x", "y", "sample_weight"], data):
+      msg += "  {} sizes: {}\n".format(
+          label, ", ".join(str(i.shape[0]) for i in nest.flatten(single_data)))
+    msg += "Make sure all arrays contain the same number of samples."
+    raise ValueError(msg)
 
 
 def _scipy_sparse_to_sparse_tensor(t):
@@ -1366,3 +1564,7 @@ def _scipy_sparse_to_sparse_tensor(t):
   indices = np.concatenate(
       (np.expand_dims(row, axis=1), np.expand_dims(col, axis=1)), axis=1)
   return sparse_tensor.SparseTensor(indices, data, shape)
+
+
+def _is_distributed_dataset(ds):
+  return isinstance(ds, input_lib.DistributedDatasetInterface)

@@ -48,8 +48,9 @@ class ShardDatasetOp::Dataset : public DatasetBase {
         input_(input),
         require_non_empty_(require_non_empty),
         traceme_metadata_(
-            {{"index", strings::Printf("%lld", index)},
-             {"num_shards", strings::Printf("%lld", num_shards)}}) {
+            {{"index", strings::Printf("%lld", static_cast<long long>(index))},
+             {"num_shards",
+              strings::Printf("%lld", static_cast<long long>(num_shards))}}) {
     input_->Ref();
   }
 
@@ -81,6 +82,11 @@ class ShardDatasetOp::Dataset : public DatasetBase {
       return n;
     }
     return n / num_shards_ + (index_ < n % num_shards_ ? 1 : 0);
+  }
+
+  Status InputDatasets(std::vector<const DatasetBase*>* inputs) const override {
+    inputs->push_back(input_);
+    return Status::OK();
   }
 
   Status CheckExternalState() const override {
@@ -122,40 +128,59 @@ class ShardDatasetOp::Dataset : public DatasetBase {
                            bool* end_of_sequence) override {
       mutex_lock l(mu_);
 
+      *end_of_sequence = false;
       if (!input_impl_) {
         *end_of_sequence = true;
         return Status::OK();
       }
 
+      int num_to_skip =
+          (dataset()->index_ - next_index_) % dataset()->num_shards_;
+      if (num_to_skip < 0) {
+        num_to_skip += dataset()->num_shards_;
+      }
+      int num_skipped;
+      TF_RETURN_IF_ERROR(
+          input_impl_->Skip(ctx, num_to_skip, end_of_sequence, &num_skipped));
+      next_index_ += num_skipped;
+      if (*end_of_sequence) {
+        input_impl_.reset();
+        return Status::OK();
+      }
+
       std::vector<Tensor> result;
-      do {
-        result.clear();
-        TF_RETURN_IF_ERROR(input_impl_->GetNext(ctx, &result, end_of_sequence));
-        if (*end_of_sequence) {
-          input_impl_.reset();
-          return Status::OK();
-        }
-      } while ((next_index_++ % dataset()->num_shards_) != dataset()->index_);
+      TF_RETURN_IF_ERROR(input_impl_->GetNext(ctx, &result, end_of_sequence));
+      if (*end_of_sequence) {
+        input_impl_.reset();
+        return Status::OK();
+      }
+      next_index_++;
 
-      while (dataset()->require_non_empty_ &&
-             next_index_ < dataset()->num_shards_) {
-        std::vector<Tensor> unused_result;
-
-        Status s = input_impl_->GetNext(ctx, &unused_result, end_of_sequence);
+      if (dataset()->require_non_empty_ &&
+          next_index_ < dataset()->num_shards_) {
+        int num_skipped;
+        Status s = input_impl_->Skip(ctx, dataset()->num_shards_ - next_index_,
+                                     end_of_sequence, &num_skipped);
         if (*end_of_sequence || errors::IsOutOfRange(s)) {
+          // `dataset()->require_non_empty_` implies that this transformation
+          // was introduced by auto_sharding rewrite, so it's acceptable
+          // produce an error message that assumes auto-sharding context.
           return errors::InvalidArgument(
-              "There aren't enough elements in this dataset for each shard to "
-              "have at least one element (# elems = ",
-              next_index_, ", ", "# shards = ", dataset()->num_shards_,
-              "). If you are using datasets with distribution strategy, "
-              "considering setting the auto sharding policy to either DATA or "
+              "Could not apply FILE based sharding: the dataset only has ",
+              next_index_, " file(s), which is not enough for the required ",
+              dataset()->num_shards_,
+              " shards/workers."
+              "If you are using datasets with distribution strategy, "
+              "consider setting the auto sharding policy to either DATA or "
               "OFF using the `experimental_distribute.auto_shard_policy` option"
-              "of `tf.data.Options()`.");
+              "of `tf.data.Options()`. Or, split your input files into a "
+              "larger number of small files such that number of files is "
+              "greater than number of shards/workers.");
         } else if (!s.ok()) {
           return s;
         }
 
-        next_index_++;
+        next_index_ = dataset()->num_shards_;
       }
 
       *out_tensors = std::move(result);
@@ -168,12 +193,13 @@ class ShardDatasetOp::Dataset : public DatasetBase {
       return model::MakeKnownRatioNode(std::move(args), dataset()->num_shards_);
     }
 
-    Status SaveInternal(IteratorStateWriter* writer) override {
+    Status SaveInternal(SerializationContext* ctx,
+                        IteratorStateWriter* writer) override {
       mutex_lock l(mu_);
       if (!input_impl_) {
         TF_RETURN_IF_ERROR(writer->WriteScalar(full_name(kInputImplEmpty), ""));
       } else {
-        TF_RETURN_IF_ERROR(SaveInput(writer, input_impl_));
+        TF_RETURN_IF_ERROR(SaveInput(ctx, writer, input_impl_));
         TF_RETURN_IF_ERROR(
             writer->WriteScalar(full_name(kNextIndex), next_index_));
       }
@@ -199,8 +225,8 @@ class ShardDatasetOp::Dataset : public DatasetBase {
 
    private:
     mutex mu_;
-    std::unique_ptr<IteratorBase> input_impl_ GUARDED_BY(mu_);
-    int64 next_index_ GUARDED_BY(mu_);
+    std::unique_ptr<IteratorBase> input_impl_ TF_GUARDED_BY(mu_);
+    int64 next_index_ TF_GUARDED_BY(mu_);
   };
 
   const int64 num_shards_;

@@ -186,6 +186,14 @@ size_t DoubleToBuffer(double value, char* buffer) {
   // this assert.
   static_assert(DBL_DIG < 20, "DBL_DIG is too big");
 
+  if (std::isnan(value)) {
+    int snprintf_result = snprintf(buffer, kFastToBufferSize, "%snan",
+                                   std::signbit(value) ? "-" : "");
+    // Paranoid check to ensure we don't overflow the buffer.
+    DCHECK(snprintf_result > 0 && snprintf_result < kFastToBufferSize);
+    return snprintf_result;
+  }
+
   if (std::abs(value) <= kDoublePrecisionCheckMax) {
     int snprintf_result =
         snprintf(buffer, kFastToBufferSize, "%.*g", DBL_DIG, value);
@@ -365,6 +373,14 @@ size_t FloatToBuffer(float value, char* buffer) {
   // this assert.
   static_assert(FLT_DIG < 10, "FLT_DIG is too big");
 
+  if (std::isnan(value)) {
+    int snprintf_result = snprintf(buffer, kFastToBufferSize, "%snan",
+                                   std::signbit(value) ? "-" : "");
+    // Paranoid check to ensure we don't overflow the buffer.
+    DCHECK(snprintf_result > 0 && snprintf_result < kFastToBufferSize);
+    return snprintf_result;
+  }
+
   int snprintf_result =
       snprintf(buffer, kFastToBufferSize, "%.*g", FLT_DIG, value);
 
@@ -385,7 +401,7 @@ size_t FloatToBuffer(float value, char* buffer) {
 
 string FpToString(Fprint fp) {
   char buf[17];
-  snprintf(buf, sizeof(buf), "%016llx", static_cast<uint64>(fp));
+  snprintf(buf, sizeof(buf), "%016llx", static_cast<long long>(fp));
   return string(buf);
 }
 
@@ -439,7 +455,7 @@ string HumanReadableNum(int64 value) {
     value = -value;
   }
   if (value < 1000) {
-    Appendf(&s, "%lld", value);
+    Appendf(&s, "%lld", static_cast<long long>(value));
   } else if (value >= static_cast<int64>(1e15)) {
     // Number bigger than 1E15; use that notation.
     Appendf(&s, "%0.3G", static_cast<double>(value));
@@ -472,7 +488,7 @@ string HumanReadableNumBytes(int64 num_bytes) {
     // No fractions for bytes.
     char buf[8];  // Longest possible string is '-XXXXB'
     snprintf(buf, sizeof(buf), "%s%lldB", neg_str,
-             static_cast<int64>(num_bytes));
+             static_cast<long long>(num_bytes));
     return string(buf);
   }
 

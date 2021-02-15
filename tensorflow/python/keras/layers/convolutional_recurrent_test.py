@@ -22,7 +22,6 @@ from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python import keras
-from tensorflow.python.framework import test_util
 from tensorflow.python.keras import keras_parameterized
 from tensorflow.python.keras import testing_utils
 from tensorflow.python.platform import test
@@ -32,7 +31,7 @@ from tensorflow.python.platform import test
 class ConvLSTMTest(keras_parameterized.TestCase):
 
   @parameterized.named_parameters(
-      *test_util.generate_combinations_with_testcase_name(
+      *testing_utils.generate_combinations_with_testcase_name(
           data_format=['channels_first', 'channels_last'],
           return_sequences=[True, False]))
   def test_conv_lstm(self, data_format, return_sequences):
@@ -203,8 +202,8 @@ class ConvLSTMTest(keras_parameterized.TestCase):
       self.assertAllClose(reference_outputs, outputs, atol=1e-5)
 
   def test_conv_lstm_with_initial_state(self):
-    num_samples = 128
-    sequence_len = 10
+    num_samples = 32
+    sequence_len = 5
     encoder_inputs = keras.layers.Input((None, 32, 32, 3))
     encoder = keras.layers.ConvLSTM2D(
         filters=32, kernel_size=(3, 3), padding='same',
@@ -223,8 +222,7 @@ class ConvLSTMTest(keras_parameterized.TestCase):
 
     model.compile(
         optimizer='sgd', loss='mse',
-        run_eagerly=testing_utils.should_run_eagerly(),
-        experimental_run_tf_function=testing_utils.should_run_tf_function())
+        run_eagerly=testing_utils.should_run_eagerly())
     x_1 = np.random.rand(num_samples, sequence_len, 32, 32, 3)
     x_2 = np.random.rand(num_samples, sequence_len, 32, 32, 4)
     y = np.random.rand(num_samples, 32, 32, 1)

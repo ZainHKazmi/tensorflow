@@ -106,7 +106,7 @@ class WorkerHeartbeatManager(object):
     self._session.run(self._ops,
                       {self._request_placeholder: message.SerializeToString()})
 
-  def ping(self, request=None, timeout_in_ms=5000):
+  def ping(self, request=None, timeout_in_ms=60000):
     """Ping all workers, returning the parsed status results."""
     if request is None:
       request = event_pb2.WorkerHeartbeatRequest()
@@ -418,7 +418,7 @@ class ResetComputation(object):
 
   def __call__(self, run_context, all_workers, lame_workers):
     del run_context, lame_workers
-    all_workers.shutdown()
+    all_workers.shutdown(exit_code=42)
 
     logging.info('Resetting coordinator.')
     raise CoordinatorResetError()
@@ -435,7 +435,7 @@ class ShutdownLameWorkers(object):
     pass
 
   def __call__(self, run_context, all_workers, lame_workers):
-    lame_workers.shutdown()
+    lame_workers.shutdown(exit_code=42)
 
 
 class ShutdownAllWorkers(object):
@@ -449,4 +449,4 @@ class ShutdownAllWorkers(object):
     pass
 
   def __call__(self, run_context, all_workers, lame_workers):
-    all_workers.shutdown()
+    all_workers.shutdown(exit_code=42)

@@ -17,15 +17,16 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CommandLine.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/IR/Builders.h"  // TF:llvm-project
-#include "mlir/IR/Identifier.h"  // TF:llvm-project
-#include "mlir/IR/Location.h"  // TF:llvm-project
-#include "mlir/IR/MLIRContext.h"  // TF:llvm-project
-#include "mlir/IR/StandardTypes.h"  // TF:llvm-project
-#include "mlir/IR/SymbolTable.h"  // TF:llvm-project
-#include "mlir/Pass/Pass.h"  // TF:llvm-project
-#include "mlir/Transforms/RegionUtils.h"  // TF:llvm-project
+#include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
+#include "mlir/IR/Builders.h"  // from @llvm-project
+#include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
+#include "mlir/IR/Identifier.h"  // from @llvm-project
+#include "mlir/IR/Location.h"  // from @llvm-project
+#include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/Matchers.h"  // from @llvm-project
+#include "mlir/IR/SymbolTable.h"  // from @llvm-project
+#include "mlir/Pass/Pass.h"  // from @llvm-project
+#include "mlir/Transforms/RegionUtils.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
 #include "tensorflow/compiler/mlir/lite/transforms/passes.h"
 #include "tensorflow/compiler/mlir/op_or_arg_name_mapper.h"
@@ -36,12 +37,13 @@ namespace {
 
 // This pass outlines the cond/body region of the TFL WhileOp into functions and
 // replaces the regions with calls to these outlined functions.
-class WhileOutlinePass : public mlir::ModulePass<WhileOutlinePass> {
+class WhileOutlinePass
+    : public mlir::PassWrapper<WhileOutlinePass, OperationPass<ModuleOp>> {
  public:
   explicit WhileOutlinePass() {}
 
  private:
-  void runOnModule() override;
+  void runOnOperation() override;
 
   // Outlines the regions of the WhileOp's cond and body and insert function
   // calls instead,
@@ -52,7 +54,6 @@ class WhileOutlinePass : public mlir::ModulePass<WhileOutlinePass> {
 
   tensorflow::OpOrArgLocNameMapper mapper_;
 };
-}  // namespace
 
 std::string WhileOutlinePass::GetName(Operation* op, StringRef suffix) {
   return (mapper_.GetUniqueName(op) + suffix).str();
@@ -60,7 +61,7 @@ std::string WhileOutlinePass::GetName(Operation* op, StringRef suffix) {
 
 // Returns whether the WhileOp is already outlined (e.g., only consists of calls
 // to functions).
-static bool IsAlreadyOutlinedd(WhileOp while_op) {
+bool IsAlreadyOutlined(WhileOp while_op) {
   auto just_call = [](Region& region) {
     auto it = region.front().begin();
     if (!isa<CallOp>(*it)) return false;
@@ -79,7 +80,7 @@ void WhileOutlinePass::OutlineWhile(WhileOp while_op) {
   // The basic block arguments correspond to values that are loop carried, while
   // all those post are loop independent. Initialize extern_values with while_op
   // not loop carried operands.
-  auto num_loop_carried = while_op.cond().front().getNumArguments();
+  auto num_loop_carried = while_op.cond().getNumArguments();
   auto not_carried_operands =
       while_op.getOperands().drop_front(num_loop_carried);
   extern_values.insert(not_carried_operands.begin(),
@@ -89,25 +90,20 @@ void WhileOutlinePass::OutlineWhile(WhileOp while_op) {
   llvm::SmallVector<Region*, 2> regions{&while_op.cond(), &while_op.body()};
   for (auto it : llvm::enumerate(regions)) {
     llvm::SetVector<Value> region_extern_values;
-    Value const_none = nullptr;
     getUsedValuesDefinedAbove(*it.value(), region_extern_values);
 
-    // Sink down none type constants into the functions.
+    // Sink down constants into the functions.
     for (auto extern_value : region_extern_values) {
-      if (!extern_value.getType().isa<NoneType>()) {
+      if (!matchPattern(extern_value, m_Constant())) {
         extern_values.insert(extern_value);
         continue;
       }
-      assert(extern_value.getDefiningOp()->hasNoSideEffect());
-      if (!const_none) {
-        // Add constant at start of region.
-        auto const_builder =
-            OpBuilder(&it.value()->front(), it.value()->front().begin());
-        const_none = const_builder.create<ConstantOp>(
-            while_op.getLoc(), extern_value.getType(),
-            const_builder.getUnitAttr());
-      }
-      replaceAllUsesInRegionWith(extern_value, const_none, *it.value());
+      // Add constant at start of region.
+      auto const_builder =
+          OpBuilder(&it.value()->front(), it.value()->front().begin());
+      auto const_value = const_builder.clone(*extern_value.getDefiningOp());
+      replaceAllUsesInRegionWith(extern_value, const_value->getResult(0),
+                                 *it.value());
     }
   }
 
@@ -123,32 +119,30 @@ void WhileOutlinePass::OutlineWhile(WhileOp while_op) {
   }
 
   // Skip if already just calls.
-  if (extra_operands.empty() && IsAlreadyOutlinedd(while_op)) return;
+  if (extra_operands.empty() && IsAlreadyOutlined(while_op)) return;
 
   // Collect new types.
   SmallVector<Type, 4> types;
   types.reserve(extra_operands.size() + while_op.getNumOperands());
-  for (BlockArgument ba : while_op.cond().front().getArguments())
-    types.push_back(ba.getType());
+  for (Type type : while_op.cond().getArgumentTypes()) types.push_back(type);
   for (Value operand : extern_values) types.push_back(operand.getType());
 
   // Create outline function from region. Optional pass extra arguments through
   // to yield.
-  SymbolTable symbol_table(getModule());
+  SymbolTable symbol_table(getOperation());
   auto create_outline_func = [&](StringRef name, Region& region,
                                  bool passthru_extra_args) {
     FunctionType type;
     if (passthru_extra_args) {
-      type = FunctionType::get(types, types, &getContext());
+      type = FunctionType::get(&getContext(), types, types);
     } else {
       SmallVector<Type, 4> result_types;
       auto operands = region.front().getTerminator()->getOperandTypes();
       result_types.append(operands.begin(), operands.end());
-      type = FunctionType::get(types, result_types, &getContext());
+      type = FunctionType::get(&getContext(), types, result_types);
     }
 
-    auto outlined_func = builder.create<FuncOp>(while_op.getLoc(), name, type,
-                                                ArrayRef<NamedAttribute>{});
+    auto outlined_func = builder.create<FuncOp>(while_op.getLoc(), name, type);
     outlined_func.getBody().takeBody(region);
     Region& func_region = outlined_func.getBody();
 
@@ -188,7 +182,7 @@ void WhileOutlinePass::OutlineWhile(WhileOp while_op) {
     b.create<ReturnOp>(yield_op->getLoc(), args);
     yield_op->erase();
     symbol_table.insert(outlined_func);
-    outlined_func.setVisibility(FuncOp::Visibility::Private);
+    outlined_func.setPrivate();
     return outlined_func;
   };
 
@@ -217,34 +211,35 @@ void WhileOutlinePass::OutlineWhile(WhileOp while_op) {
   // change, so replace with new while op.
   if (extra_operands.empty()) return;
 
-  Operation* op = while_op.getOperation();
+  const int operands_size = while_op.getNumOperands() + extra_operands.size();
   SmallVector<Value, 4> operands;
+  operands.reserve(operands_size);
+  operands.append(while_op.getOperands().begin(), while_op.getOperands().end());
+  operands.append(extra_operands.begin(), extra_operands.end());
   SmallVector<Type, 4> new_types;
-  operands.reserve(types.size());
-  new_types.reserve(operands.size());
-  auto add_operand = [&](Value v) {
-    operands.push_back(v);
-    new_types.push_back(v.getType());
-  };
-  for (auto operand : op->getOperands()) add_operand(operand);
-  for (auto operand : extra_operands) add_operand(operand);
+  new_types.reserve(operands_size);
+  new_types.append(while_op.getResultTypes().begin(),
+                   while_op.getResultTypes().end());
+  for (auto extra_operand : extra_operands)
+    new_types.push_back(extra_operand.getType());
 
-  Operation* new_op = OpBuilder(op).insert(Operation::create(
-      op->getLoc(), op->getName(), new_types, operands, op->getAttrs(),
-      /*successors=*/{}, /*numRegions=*/2,
-      /*resizableOperandList=*/true));
-  for (int i = 0; i < 2; ++i) new_op->getRegion(i).takeBody(op->getRegion(i));
-  op->replaceAllUsesWith(new_op->getResults().take_front(op->getNumResults()));
-  op->erase();
+  auto new_while_op = OpBuilder(while_op).create<WhileOp>(
+      while_op.getLoc(), new_types, operands, while_op.getAttrs());
+  new_while_op.cond().takeBody(while_op.cond());
+  new_while_op.body().takeBody(while_op.body());
+  while_op.replaceAllUsesWith(
+      new_while_op.getResults().take_front(while_op.getNumResults()));
+  while_op.erase();
 }
 
-void WhileOutlinePass::runOnModule() {
-  getModule().walk(
+void WhileOutlinePass::runOnOperation() {
+  getOperation().walk(
       [&](mlir::TFL::WhileOp while_op) { OutlineWhile(while_op); });
 }
+}  // namespace
 
 // Creates an instance of the TensorFlow Lite dialect WhileOp outline pass.
-std::unique_ptr<OpPassBase<ModuleOp>> CreateWhileOutlinePass() {
+std::unique_ptr<OperationPass<ModuleOp>> CreateWhileOutlinePass() {
   return std::make_unique<WhileOutlinePass>();
 }
 

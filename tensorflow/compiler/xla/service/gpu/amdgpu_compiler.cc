@@ -76,45 +76,13 @@ Status AMDGPUCompiler::OptimizeHloConvolutionCanonicalization(
   // Convert convolutions into CustomCalls to MIOpen, then canonicalize them
   // (PadInsertion).
   HloPassPipeline pipeline("conv_canonicalization");
-  pipeline.AddInvariantChecker<HloVerifier>(/*layout_sensitive=*/false,
-                                            /*allow_mixed_precision=*/false);
+  pipeline.AddInvariantCheckerDebug<HloVerifier>(
+      /*layout_sensitive=*/false,
+      /*allow_mixed_precision=*/false);
   pipeline.AddPass<GpuConvRewriter>();
   pipeline.AddPass<GpuConvPaddingLegalization>();
 
   pipeline.AddPass<HloConstantFolding>();
-  TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
-
-  return Status::OK();
-}
-
-Status AMDGPUCompiler::OptimizeHloPostLayoutAssignment(
-    HloModule* hlo_module, se::StreamExecutor* stream_exec,
-    se::DeviceMemoryAllocator* device_allocator) {
-  HloPassPipeline pipeline("post-layout_assignment");
-  pipeline.AddInvariantChecker<HloVerifier>(
-      /*layout_sensitive=*/true,
-      /*allow_mixed_precision=*/false,
-      LayoutAssignment::InstructionCanChangeLayout);
-
-  pipeline.AddPass<ReductionDegenerateDimRemover>();
-  pipeline.AddPass<ReductionLayoutNormalizer>();
-  pipeline.AddPass<ReductionDimensionGrouper>();
-
-  // The LayoutAssignment pass may leave behind kCopy instructions which are
-  // duplicate or NOPs, so remove them with algebraic simplification and CSE.
-  AlgebraicSimplifierOptions options;
-  options.set_is_layout_sensitive(true);
-  pipeline.AddPass<HloPassFix<AlgebraicSimplifier>>(options);
-
-  // Rewrite GEMMs into custom calls.
-  pipeline.AddPass<GemmRewriter>();
-
-  pipeline.AddPass<GpuConvAlgorithmPicker>(stream_exec, device_allocator);
-
-  // Clean up new_tuple described above.
-  pipeline.AddPass<TupleSimplifier>();
-
-  pipeline.AddPass<HloCSE>(/*is_layout_sensitive=*/true);
   TF_RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
 
   return Status::OK();
@@ -132,33 +100,39 @@ GpuVersion AMDGPUCompiler::GetGpuVersion(se::StreamExecutor* stream_exec) {
         << "Couldn't get AMDGPU ISA version for device; assuming gfx803.";
     isa_version = 803;
   }
+  std::string gcn_arch_name =
+      stream_exec->GetDeviceDescription().rocm_amdgpu_gcn_arch_name();
+  if (gcn_arch_name == stream_exec->GetDeviceDescription().kUndefinedString) {
+    LOG(WARNING) << "Couldn't get AMDGPU GCN Arch for device; assuming gfx803.";
+    gcn_arch_name = "gfx803";
+  }
 
-  return isa_version;
+  return std::make_pair(isa_version, gcn_arch_name);
 }
 
 StatusOr<std::pair<std::string, std::vector<uint8>>>
-AMDGPUCompiler::CompileTargetBinary(const HloModule* module,
+AMDGPUCompiler::CompileTargetBinary(const HloModuleConfig& module_config,
                                     llvm::Module* llvm_module,
                                     GpuVersion gpu_version,
-                                    se::StreamExecutor* stream_exec) {
+                                    se::StreamExecutor* stream_exec,
+                                    bool relocatable,
+                                    const HloModule* debug_module) {
   if (rocdl_dir_.empty()) {
     // Compute rocdl_dir_ just once and cache it in this member.
-    rocdl_dir_ = GetROCDLDir(module->config());
+    rocdl_dir_ = GetROCDLDir(module_config);
+  }
+
+  if (relocatable) {
+    return Unimplemented("relocatable target binary is not implemented");
   }
 
   std::vector<uint8> hsaco;
   {
     XLA_SCOPED_LOGGING_TIMER(
         "AMDGPUCompiler::CompileTargetBinary - CompileToHsaco");
-    TF_ASSIGN_OR_RETURN(hsaco,
-                        amdgpu::CompileToHsaco(llvm_module, gpu_version,
-                                               module->config(), rocdl_dir_));
-  }
-
-  llvm_ir::DumpIrIfEnabled(*module, *llvm_module, /*optimized=*/false);
-
-  if (user_post_optimization_hook_) {
-    user_post_optimization_hook_(*llvm_module);
+    TF_ASSIGN_OR_RETURN(
+        hsaco, amdgpu::CompileToHsaco(llvm_module, gpu_version, module_config,
+                                      rocdl_dir_));
   }
 
   return std::pair<std::string, std::vector<uint8>>("", std::move(hsaco));
